@@ -3,7 +3,7 @@ library(tidyverse)
 library(ipumsr)
 library(fixest)
 library(miceadds)
-
+tinytex::install_tinytex()
 #LOAD ACS DATA
 setwd("/Users/ryan/DataspellProjects/direct_admissions/")
 ddi <- read_ipums_ddi("usa_00019.xml", lower_vars = TRUE)
