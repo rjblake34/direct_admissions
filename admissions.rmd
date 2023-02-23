@@ -1,0 +1,291 @@
+---
+title: "The effect of direct admissions programs on college enrollment"
+author: "Ryan Blake"
+output: html_document
+---
+
+
+# CLEAN
+#### LOAD FILES AND PACKAGES
+Note: This analysis relies on ACS data provided by IPUMS. The ACS extract exceeds the 100 MB limit for GitHub and is
+not attached to the git repo. The file is stored locally and is available on request.
+
+This chunk loads dependencies, the ACS microdata, and the ACS metadata. It then loads a sheet containing binary
+variables that outline the policy timeline for each state--i.e., 1 for states/years with direct admissions and 0
+otherwise. The last line loads state-level NHGIS data from 2010; this data is for DiNardo Fortin Lemieux (DFL)
+reweights.
+
+```{r, message=FALSE, warning=FALSE}
+#rm(list = ls(all.names = TRUE))
+library(tidyverse)
+library(ipumsr)
+library(fixest)
+library(miceadds)
+
+setwd("/Users/ryan/DataspellProjects/direct_admissions/")
+ddi <- read_ipums_ddi("usa_00019.xml", lower_vars = TRUE)
+ipums <- read_ipums_micro(ddi)
+
+policysheet <- read.csv("/Users/ryan/DataspellProjects/direct_admissions/policysheet.csv")
+
+nhgis <- read.csv("/Users/ryan/DataspellProjects/direct_admissions/nhgis.csv")
+```
+
+
+#### CALCULATE DFL REWEIGHTS
+This chunk creates the variable necessary for DFL reweighting. It first cleans the NHGIS data to create new variables
+that describe a states urban/rural mix, high school graduation rate, college attendance rate, youth unemployment rate,
+and portion of adults serving in the military. Note that these variables are taken from states at a baseline period
+prior to adoption (2010, in this case). This sheet is then merged with the policy implementation timeline.
+
+Next, a probit regression is run to predict the likelihood that a state has adopted the policy at some point during
+the observation period. These fitted values are then assigned to states that have adopted the policy; a value of 0 is
+assigned to state that have not adopted the policy.
+
+Finally, this chunk runs a series of checks to assess the validity of each chosen variable.
+
+```{r, message = FALSE, warning=FALSE}
+nhgis <- nhgis %>%
+  mutate(
+    #percent living in rural area
+    rural_pct = rural / total_region,
+    #percent w/ high school degree
+    hs_complete_pct =
+      (malehs+malecollege1+malecollege2+maleassoc+malebach+malemaster+maleprof+maledoc+
+        femalehs+femalecollege1+femalecollege2+femaleassoc+femalebach+femalemaster+femaleprof+femaledoc)/
+        total_attainment,
+    #percent college go on
+    college_pct =
+      (malecollege1+malecollege2+maleassoc+malebach+malemaster+maleprof+maledoc+
+        femalecollege1+femalecollege2+femaleassoc+femalebach+femalemaster+femaleprof+femaledoc)/
+        (malehs +femalehs),
+    #percent young adults <25 unemployed in labor force
+    youth_unemployment =
+      (male16_labor_civ_unemployed + male20_labor_civ_unemployed + male22_labor_civ_unemployed +
+        female16_labor_civ_unemployed + female20_labor_civ_unemployed + female22_labor_civ_unemployed)/
+        (male16_labor_civ + male20_labor_civ + male22_labor_civ +
+          female16_labor_civ + female20_labor_civ + female22_labor_civ),
+    #percent young adults <25 in labor force who serve in the military
+    vet_pct =
+      (male16_labor_vet + male20_labor_vet + male22_labor_vet +
+        female16_labor_vet + female20_labor_vet + female22_labor_vet)/
+        (male16_labor_total + male20_labor_total + male22_labor_total +
+          female16_labor_total + female20_labor_total + female22_labor_total),
+  )%>%
+  select(state, statefip, rural_pct, hs_complete_pct, youth_unemployment, vet_pct, median_income)
+
+#MERGE POLICY AND NHGIS DATA
+states <- merge(policysheet, nhgis, by=c("state","statefip"))
+
+
+#CALCULATE DFL
+reg_nhgis <- glm(da2020 ~ rural_pct + hs_complete_pct + youth_unemployment + vet_pct +  median_income,
+                 family=binomial(link='probit'), data = states)
+
+#PRINT DFL REGRESSION RESULTS
+summary(reg_nhgis)
+with(summary(reg_nhgis), 1 - deviance/null.deviance) #print r squared
+
+#FIT DFL REGRESSION RESULTS TO STATES
+predict_da <- fitted(reg_nhgis)
+states  <- states %>%
+  mutate(pda = predict_da,
+         dfl = ifelse(da2020 == 1, 1, (predict_da/(1-predict_da))))
+
+#DFL VARIABLE CHECK
+lm(rural_pct ~ da2020, data = states)
+lm(rural_pct ~ da2020, data = states, weights = dfl)
+
+lm(hs_complete_pct ~ da2020, data = states)
+lm(hs_complete_pct ~ da2020, data = states, weights = dfl)
+
+lm(youth_unemployment ~ da2020, data = states)
+lm(youth_unemployment ~ da2020, data = states, weights = dfl)
+
+lm(vet_pct ~ da2020, data = states)
+lm(vet_pct ~ da2020, data = states, weights = dfl)
+
+lm(median_income ~ da2020, data = states)
+lm(median_income~ da2020, data = states, weights = dfl)
+
+
+```
+
+
+#### MERGE STATE DATA WITH IPUMS DATA
+This chunk converts the wide state-level data to long data, and then merges with the ACS microdata. The data is then
+filtered to include only 19-year-old high school graduates who have lived in the same state for more than 1 year
+(a distinction which is necessary for defining who received treatment).
+
+The outcome variable (enroll) is then created to include those who are currently attending a post-secondary institution.
+A series of independent variables are also created to be used as controls.
+
+```{r, message = FALSE, warning=FALSE}
+#WIDE DATA TO LONG DATA
+states_long <- states %>%
+  pivot_longer(
+    starts_with("da"),
+    names_to = c(".value", "year"),
+    names_pattern = "^(.*?)(\\d+)$",
+  ) %>%
+  mutate(year = as.numeric(year))
+
+#MERGE STATE LEVEL POLICY DATA ONE TO MANY WITH ACS DATA
+df <- inner_join(states_long, ipums, by = c("statefip", "year"), multiple = "all")
+
+#FILTER TO INCLUDE ONLY HIGH SCHOOL GRADUATES
+#MUTATE TO CREATE BINARY OUTCOME VARIABLE 'ENROLL' & ADD CONTROLS
+df <- df %>%
+        filter(educd >= 63, age == 19, school == 1 | school == 2, migrate1 == 1 | migrate1 == 2) %>%
+        mutate(enroll = ifelse(educd >= 65, 1, 0), #OUTCOME VARIABLE
+               female = ifelse(sex == 2, 1,0),
+               hispanic = ifelse(hispand > 0,1,0),
+               black = ifelse(race == 2 & hispand == 0,1,0),
+               othrace = ifelse(race > 2 & hispand == 0,1,0),
+               citizen = ifelse(citizen == 3, 0, 1),
+               english = ifelse(speakeng == 1, 0, 1),
+               insurance = ifelse(hcovany == 1, 0, 1),
+               dflrewt = perwt*dfl)
+```
+
+
+# RESULTS
+
+#### SUMMARY STATISTICS
+
+This chunk prints a series of summary statistics.
+
+```{r, message = FALSE, warning=FALSE}
+df %>%
+        summarize(
+                n = n(),
+                college_go_on = mean(enroll),
+                college_go_on_sd = sd(enroll),
+                female = mean(female),
+                black = mean(black),
+                hispanic = mean(hispanic),
+                othrace = mean(othrace),
+                citizen = mean(citizen),
+                english = mean(english),
+                insurance = mean(insurance))
+
+df %>%
+        group_by(year) %>%
+        summarize(
+                n = n(),
+                college_go_on = mean(enroll),
+                college_go_on_sd = sd(enroll),
+                female = mean(female),
+                black = mean(black),
+                hispanic = mean(hispanic),
+                othrace = mean(othrace),
+                citizen = mean(citizen),
+                english = mean(english),
+                insurance = mean(insurance))
+
+df %>%
+        group_by(da) %>%
+        summarize(
+                n = n(),
+                college_go_on = mean(enroll),
+                college_go_on_sd = sd(enroll),
+                female = mean(female),
+                black = mean(black),
+                hispanic = mean(hispanic),
+                othrace = mean(othrace),
+                citizen = mean(citizen),
+                english = mean(english),
+                insurance = mean(insurance))
+```
+
+
+#### OLS MODELS
+
+This chunk runs two separate OLS models and prints the results (including r^2). The first model uses person level
+weights supplied in the ACS data; the second model uses the DFL reweights calculated from NHGIS data. Both models
+control for gender, race, ethnicity, citizenship, health insurance, English proficiency, and state/year fixed effects.
+Standard errors are clustered at the state level.
+
+```{r, message = FALSE, warning=FALSE}
+#OLS - PERSON LEVEL WEIGHTS
+olsmod1 <- miceadds::glm.cluster(data=df,
+                                 formula=enroll ~ da + female + hispanic + black + othrace + citizen + insurance + english +
+                                         factor(statefip) + factor(year),
+                                 cluster="state",
+                                 weights= df$perwt,
+                                 family="gaussian")
+summary(olsmod1$glm_res)
+with(summary(olsmod1$glm_res), 1 - deviance/null.deviance) #print r squared
+
+
+# OLS - DFL REWEIGHTS
+olsmod2 <- miceadds::glm.cluster(data=df,
+                                 formula=enroll ~ da + female + hispanic + black + othrace + citizen + insurance + english +
+                                         factor(statefip) + factor(year),
+                                 cluster="state",
+                                 weights= df$dflrewt,
+                                 family="gaussian")
+summary(olsmod2$glm_res)
+with(summary(olsmod2$glm_res), 1 - deviance/null.deviance) #print r squared
+
+```
+
+
+#### LOGIT MODELS
+
+This chunk runs two separate logit models and prints the results (including r^2). The first model uses person level
+weights supplied in the ACS data; the second model uses the DFL reweights calculated from NHGIS data. Both models
+control for gender, race, ethnicity, citizenship, health insurance, English proficiency, and state/year fixed effects.
+Standard errors are clustered at the state level.
+
+```{r, message = FALSE, warning=FALSE}
+#LOGIT - DFL REWEIGHT
+logmod1 <- miceadds::glm.cluster(data=df,
+                                 formula= enroll ~ da + female + hispanic + black + othrace + citizen + insurance + english +
+                                         factor(statefip) + factor(year),
+                                 cluster="state",
+                                 weights= df$perwt,
+                                 family=binomial(link= "logit"))
+summary(logmod1$glm_res)
+with(summary(logmod1$glm_res), 1 - deviance/null.deviance) #print r squared
+
+#LOGIT - DFL REWEIGHT
+logmod2 <- miceadds::glm.cluster(data=df,
+                                 formula= enroll ~ da + female + hispanic + black + othrace + citizen + insurance + english +
+                                         factor(statefip) + factor(year),
+                                 cluster="state",
+                                 weights= df$dflrewt,
+                                 family=binomial(link= "logit"))
+summary(logmod2$glm_res)
+with(summary(logmod2$glm_res), 1 - deviance/null.deviance) #print r squared
+```
+
+
+#### EVENT STUDY
+
+This chunk performs an event study using the feols function from the fixest package. The first call writes a new
+variable to comply with the requirements of the package. The second call runs an OLS regression (note: the package does
+not currently allow for binomial regression, which is more appropriate for this study). The last two calls print a
+summary of the regression and plot the results.
+
+```{r, message = FALSE, warning=FALSE}
+#### EVENT STUDY
+##https://lost-stats.github.io/Model_Estimation/Research_Design/event_study.html
+
+event_study <- df %>%
+        mutate(year_treated = case_when(state == "Idaho" ~ 2016,
+                                        state == "South Dakota" ~ 2018,
+                                        state != "Idaho" | state != "South Dakota" ~ 0))
+
+es_dflrewt = feols(enroll ~ sunab(year_treated, year, ref.p = -1) +
+        female + hispanic + black + othrace + citizen + insurance + english |
+        state + year,
+                   cluster = ~statefip,
+                   weights = event_study$dflrewt,
+                   data = event_study)
+
+summary(es_dflrewt)
+iplot(es_dflrewt,
+      xlab = 'Time to treatment',
+      main = 'Event study: Staggered treatment (TWFE)')
+```
